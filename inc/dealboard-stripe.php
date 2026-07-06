@@ -3,7 +3,7 @@
  * DealBoard / American Alley — Stripe Subscriptions for Business Ads
  *
  * Business listings are billed as a $2 / 30-day Stripe subscription:
- *   - Payment is collected IN-PAGE via Stripe Payment Element (no redirect to Stripe).
+ *   - Payment is collected via Stripe-hosted Checkout (redirect to Stripe).
  *   - Auto-pay ON  → Stripe charges $2 every 30 days; each paid invoice extends the
  *     listing another 30 days.
  *   - Auto-pay OFF → the subscription is set to cancel at period end; once the 30
@@ -51,6 +51,50 @@ function dealboard_stripe_is_ready() {
     $pk = dealboard_stripe_pub_key();
     return $sk && $pk;
 }
+
+/**
+ * Returns a short fingerprint of the current secret key.
+ * Stored alongside every cus_xxx / product_id so we can detect
+ * key changes without making a live Stripe API call.
+ */
+function dealboard_stripe_key_fingerprint() {
+    return substr( md5( dealboard_stripe_secret() ), 0, 12 );
+}
+
+/**
+ * Called whenever the Stripe settings are saved.
+ * Clears all cached customer IDs and product IDs that belong
+ * to the old key, so users get fresh records on next payment.
+ */
+function dealboard_stripe_flush_on_key_change() {
+    $new_opts = get_option( 'dealboard_stripe', [] );
+    $old_fp   = get_option( 'dealboard_stripe_key_fp', '' );
+    $new_fp   = substr( md5( trim( $new_opts['secret_key'] ?? '' ) ), 0, 12 );
+
+    if ( $old_fp && $old_fp === $new_fp ) return; // key unchanged
+
+    // Save new fingerprint
+    update_option( 'dealboard_stripe_key_fp', $new_fp );
+
+    // Clear cached Stripe product ID (tied to old key)
+    $old_prod_key = 'dealboard_stripe_prod_' . md5( '' ); // fallback
+    // Remove any product option whose key starts with our prefix
+    global $wpdb;
+    $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE 'dealboard_stripe_prod_%'" );
+
+    // Clear Stripe customer meta from all users
+    $wpdb->delete( $wpdb->usermeta, [ 'meta_key' => 'dealboard_stripe_customer' ] );
+    $wpdb->delete( $wpdb->usermeta, [ 'meta_key' => 'dealboard_stripe_key_fp' ] );
+
+    // Clear Stripe customer meta from all listings
+    $wpdb->delete( $wpdb->postmeta, [ 'meta_key' => 'listing_stripe_customer' ] );
+    $wpdb->delete( $wpdb->postmeta, [ 'meta_key' => 'listing_stripe_key_fp' ] );
+
+    // Also clear any stale subscription IDs (they won't exist in the new account)
+    $wpdb->delete( $wpdb->postmeta, [ 'meta_key' => 'listing_stripe_subscription' ] );
+}
+add_action( 'update_option_dealboard_stripe', 'dealboard_stripe_flush_on_key_change' );
+add_action( 'add_option_dealboard_stripe',    'dealboard_stripe_flush_on_key_change' );
 
 /* ===========================================================
    LOW-LEVEL API WRAPPER
@@ -164,168 +208,9 @@ function dealboard_stripe_get_or_create_product() {
 }
 
 /* ===========================================================
-   STEP 1 — AJAX: Create / reuse Stripe Customer + Subscription,
-   return the subscription's client_secret for the Payment Element.
-=========================================================== */
-add_action( 'wp_ajax_dealboard_create_payment_intent', 'dealboard_ajax_create_payment_intent' );
-
-function dealboard_ajax_create_payment_intent() {
-    if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'dealboard_stripe_nonce' ) ) {
-        wp_send_json_error( [ 'message' => 'Security check failed.' ] );
-    }
-    if ( ! is_user_logged_in() ) {
-        wp_send_json_error( [ 'message' => 'You must be logged in.' ] );
-    }
-    if ( ! dealboard_stripe_is_ready() ) {
-        wp_send_json_error( [ 'message' => 'Stripe is not configured. Please contact support.' ] );
-    }
-
-    $listing_id = (int) ( $_POST['listing_id'] ?? 0 );
-    if ( ! $listing_id ) {
-        wp_send_json_error( [ 'message' => 'Invalid listing.' ] );
-    }
-
-    $post = get_post( $listing_id );
-    if ( ! $post || $post->post_author != get_current_user_id() ) {
-        wp_send_json_error( [ 'message' => 'Listing not found.' ] );
-    }
-
-    $o    = dealboard_stripe_opts();
-    $user = wp_get_current_user();
-
-    // ── 1. Get or create Stripe Customer ──────────────────────────────────
-    $customer_id = get_post_meta( $listing_id, 'listing_stripe_customer', true )
-                ?: get_user_meta( $user->ID, 'dealboard_stripe_customer', true );
-
-    if ( ! $customer_id ) {
-        $cust = dealboard_stripe_api( 'POST', 'customers', [
-            'email'    => $user->user_email,
-            'name'     => $user->display_name,
-            'metadata' => [ 'wp_user_id' => $user->ID ],
-        ] );
-        if ( is_wp_error( $cust ) ) {
-            wp_send_json_error( [ 'message' => $cust->get_error_message() ] );
-        }
-        $customer_id = $cust['id'];
-        update_user_meta( $user->ID, 'dealboard_stripe_customer', $customer_id );
-    }
-    update_post_meta( $listing_id, 'listing_stripe_customer', $customer_id );
-
-    // ── 2. Get or create Product ID ───────────────────────────────────────
-    $product_id = dealboard_stripe_get_or_create_product();
-    if ( is_wp_error( $product_id ) ) {
-        wp_send_json_error( [ 'message' => 'Product setup failed: ' . $product_id->get_error_message() ] );
-    }
-
-    // ── 3. Create a Subscription with payment_behavior=default_incomplete ──
-    //    This gives us a client_secret we can pass to the Payment Element.
-    //    The subscription only becomes active when the Payment Element confirms.
-    $sub = dealboard_stripe_api( 'POST', 'subscriptions', [
-        'customer'         => $customer_id,
-        'items'            => [ [
-            'price_data' => [
-                'currency'    => $o['currency'],
-                'unit_amount' => (int) $o['amount'],
-                'recurring'   => [ 'interval' => $o['interval'], 'interval_count' => 1 ],
-                'product'     => $product_id,
-            ],
-        ] ],
-        'payment_behavior' => 'default_incomplete',
-        'payment_settings' => [ 'save_default_payment_method' => 'on_subscription' ],
-        'expand'           => [ 'latest_invoice.payment_intent' ],
-        'metadata'         => [ 'listing_id' => $listing_id, 'wp_user_id' => $user->ID ],
-    ] );
-
-    if ( is_wp_error( $sub ) ) {
-        wp_send_json_error( [ 'message' => $sub->get_error_message() ] );
-    }
-
-    $client_secret = $sub['latest_invoice']['payment_intent']['client_secret'] ?? '';
-    if ( ! $client_secret ) {
-        wp_send_json_error( [ 'message' => 'Could not create payment intent. Please try again.' ] );
-    }
-
-    // Store the subscription ID immediately so we can activate on confirmation
-    update_post_meta( $listing_id, 'listing_stripe_subscription', $sub['id'] );
-
-    wp_send_json_success( [
-        'client_secret'   => $client_secret,
-        'publishable_key' => dealboard_stripe_pub_key(),
-        'amount'          => $o['amount'],
-        'currency'        => strtoupper( $o['currency'] ),
-        'listing_title'   => get_the_title( $listing_id ),
-        'sub_id'          => $sub['id'],
-    ] );
-}
-
-/* ===========================================================
-   STEP 2 — AJAX: Confirm payment success (called after
-   stripe.confirmPayment resolves on the client side).
-=========================================================== */
-add_action( 'wp_ajax_dealboard_confirm_payment', 'dealboard_ajax_confirm_payment' );
-
-function dealboard_ajax_confirm_payment() {
-    if ( ! isset( $_POST['nonce'] ) || ! wp_verify_nonce( $_POST['nonce'], 'dealboard_stripe_nonce' ) ) {
-        wp_send_json_error( [ 'message' => 'Security check failed.' ] );
-    }
-    if ( ! is_user_logged_in() ) {
-        wp_send_json_error( [ 'message' => 'Not logged in.' ] );
-    }
-
-    $listing_id     = (int) ( $_POST['listing_id'] ?? 0 );
-    $payment_intent = sanitize_text_field( $_POST['payment_intent'] ?? '' );
-    $sub_id         = sanitize_text_field( $_POST['sub_id'] ?? '' );
-
-    if ( ! $listing_id || ! $payment_intent ) {
-        wp_send_json_error( [ 'message' => 'Missing data.' ] );
-    }
-
-    $post = get_post( $listing_id );
-    if ( ! $post || $post->post_author != get_current_user_id() ) {
-        wp_send_json_error( [ 'message' => 'Listing not found.' ] );
-    }
-
-    // Verify the PaymentIntent status with Stripe
-    $pi = dealboard_stripe_api( 'GET', 'payment_intents/' . rawurlencode( $payment_intent ), [] );
-    if ( is_wp_error( $pi ) ) {
-        wp_send_json_error( [ 'message' => $pi->get_error_message() ] );
-    }
-
-    $pi_status = $pi['status'] ?? '';
-
-    if ( $pi_status === 'succeeded' ) {
-        // Activate the listing
-        if ( $sub_id ) {
-            update_post_meta( $listing_id, 'listing_stripe_subscription', $sub_id );
-            update_post_meta( $listing_id, 'listing_autopay', '1' );
-            // Fetch period end from subscription
-            $sub = dealboard_stripe_api( 'GET', 'subscriptions/' . rawurlencode( $sub_id ), [] );
-            $period_end = ( ! is_wp_error( $sub ) && ! empty( $sub['current_period_end'] ) )
-                ? (int) $sub['current_period_end'] : 0;
-            dealboard_activate_business_listing( $listing_id, $period_end );
-        } else {
-            dealboard_activate_business_listing( $listing_id );
-        }
-        wp_send_json_success( [
-            'message'      => 'Payment successful! Your business listing is now live.',
-            'redirect'     => home_url( '/dashboard/?payment_success=1' ),
-        ] );
-    } elseif ( in_array( $pi_status, [ 'processing', 'requires_capture' ], true ) ) {
-        // Still processing — activate optimistically, webhook will confirm
-        dealboard_activate_business_listing( $listing_id );
-        wp_send_json_success( [
-            'message'  => 'Payment is processing. Your listing will go live shortly.',
-            'redirect' => home_url( '/dashboard/?payment_success=1' ),
-        ] );
-    } else {
-        wp_send_json_error( [ 'message' => 'Payment not completed. Status: ' . $pi_status ] );
-    }
-}
-
-/* ===========================================================
-   LEGACY DIRECT PAY URL (?dealboard_pay=1&listing=ID)
-   Kept for dashboard "Pay $2 & Activate" button backward compat.
-   Opens the on-page modal instead of redirecting to Stripe.
+   DIRECT PAY URL (?dealboard_pay=1&listing=ID)
+   Creates a Stripe Checkout Session and redirects the user
+   to Stripe's hosted payment page.
 =========================================================== */
 add_action( 'template_redirect', function() {
     if ( empty( $_GET['dealboard_pay'] ) ) return;
@@ -352,8 +237,178 @@ add_action( 'template_redirect', function() {
         exit;
     }
 
-    // Redirect to dashboard with modal trigger param
-    wp_safe_redirect( home_url( '/dashboard/?open_payment_modal=' . $listing_id ) );
+    $o    = dealboard_stripe_opts();
+    $user = wp_get_current_user();
+
+    // ── 1. Get or create Stripe Customer ──────────────────────────────────
+    // Dynamic key detection: we store a fingerprint (hash) of the secret key
+    // alongside each customer ID. If keys change, fingerprint mismatches instantly
+    // — no live API call needed — and a fresh customer is created automatically.
+    $current_fp  = dealboard_stripe_key_fingerprint();
+    $stored_fp   = get_user_meta( $user->ID, 'dealboard_stripe_key_fp', true );
+    $customer_id = ( $stored_fp === $current_fp )
+        ? ( get_post_meta( $listing_id, 'listing_stripe_customer', true )
+            ?: get_user_meta( $user->ID, 'dealboard_stripe_customer', true ) )
+        : '';
+
+    if ( ! $customer_id ) {
+        $cust = dealboard_stripe_api( 'POST', 'customers', [
+            'email'    => $user->user_email,
+            'name'     => $user->display_name,
+            'metadata' => [ 'wp_user_id' => $user->ID ],
+        ] );
+        if ( is_wp_error( $cust ) ) {
+            wp_safe_redirect( home_url( '/dashboard/?payment_error=' . rawurlencode( $cust->get_error_message() ) ) );
+            exit;
+        }
+        $customer_id = $cust['id'];
+        update_user_meta( $user->ID, 'dealboard_stripe_customer', $customer_id );
+        update_user_meta( $user->ID, 'dealboard_stripe_key_fp', $current_fp );  // save fingerprint
+    }
+    update_post_meta( $listing_id, 'listing_stripe_customer', $customer_id );
+
+    // ── 2. Get or create Product ID ───────────────────────────────────────
+    $product_id = dealboard_stripe_get_or_create_product();
+    if ( is_wp_error( $product_id ) ) {
+        wp_safe_redirect( home_url( '/dashboard/?payment_error=' . rawurlencode( 'Product setup failed: ' . $product_id->get_error_message() ) ) );
+        exit;
+    }
+
+    // ── 3. Build return & cancel URLs ─────────────────────────────────────
+    $return_nonce  = wp_create_nonce( 'db_stripe_return_' . $listing_id );
+    $success_url   = add_query_arg( [
+        'dealboard_stripe_return' => '1',
+        'listing'                 => $listing_id,
+        '_wpnonce'                => $return_nonce,
+    ], home_url( '/dashboard/' ) );
+    $cancel_url    = add_query_arg( [
+        'dealboard_payment' => 'cancel',
+        'listing'           => $listing_id,
+    ], home_url( '/dashboard/' ) );
+
+    // ── 4. Create Stripe Checkout Session ─────────────────────────────────
+    // TEST MODE: use 1-day interval so renewal fires quickly for testing.
+    // LIVE MODE: use the configured interval (default: month).
+    // Note: Stripe minimum interval is 1 day — minute/hour not supported.
+    $test_mode        = ! empty( $o['test_mode'] );
+    $billing_interval = $test_mode ? 'day'  : $o['interval'];
+    $billing_count    = $test_mode ? 1      : 1;
+
+    $session = dealboard_stripe_api( 'POST', 'checkout/sessions', [
+        'customer'            => $customer_id,
+        'mode'                => 'subscription',
+        'line_items'          => [ [
+            'price_data' => [
+                'currency'    => $o['currency'],
+                'unit_amount' => (int) $o['amount'],
+                'recurring'   => [ 'interval' => $billing_interval, 'interval_count' => $billing_count ],
+                'product'     => $product_id,
+            ],
+            'quantity'   => 1,
+        ] ],
+        'payment_method_collection' => 'always',
+        'subscription_data'   => [
+            'metadata' => [
+                'listing_id' => $listing_id,
+                'wp_user_id' => $user->ID,
+            ],
+        ],
+        'metadata'            => [
+            'listing_id' => $listing_id,
+            'wp_user_id' => $user->ID,
+        ],
+        'success_url'         => $success_url,
+        'cancel_url'          => $cancel_url,
+    ] );
+
+    if ( is_wp_error( $session ) ) {
+        wp_safe_redirect( home_url( '/dashboard/?payment_error=' . rawurlencode( $session->get_error_message() ) ) );
+        exit;
+    }
+
+    // Mark listing as pending_payment while user is on Stripe's page
+    update_post_meta( $listing_id, 'listing_status', 'pending_payment' );
+
+    // Redirect user to Stripe-hosted Checkout page
+    wp_redirect( $session['url'] );
+    exit;
+}, 5 );
+
+/* ===========================================================
+   STRIPE CHECKOUT RETURN  (?dealboard_stripe_return=1&listing=ID)
+   Stripe redirects the user back here after payment.
+   We verify the nonce, then check subscription status to activate.
+=========================================================== */
+add_action( 'template_redirect', function() {
+    if ( empty( $_GET['dealboard_stripe_return'] ) ) return;
+
+    $listing_id = (int) ( $_GET['listing'] ?? 0 );
+
+    if ( ! is_user_logged_in() ) {
+        wp_safe_redirect( home_url( '/sign-in' ) ); exit;
+    }
+    if ( ! $listing_id ) {
+        wp_safe_redirect( home_url( '/dashboard/' ) ); exit;
+    }
+
+    // Verify the return nonce
+    if ( ! isset( $_GET['_wpnonce'] ) || ! wp_verify_nonce( $_GET['_wpnonce'], 'db_stripe_return_' . $listing_id ) ) {
+        wp_die( 'Security check failed.', 'Error', [ 'response' => 403, 'back_link' => true ] );
+    }
+
+    $post = get_post( $listing_id );
+    if ( ! $post || $post->post_author != get_current_user_id() ) {
+        wp_die( 'Listing not found.' );
+    }
+
+    // Fetch the subscription stored on the listing (webhook may have already set it),
+    // or look it up via the Stripe customer.
+    $sub_id = get_post_meta( $listing_id, 'listing_stripe_subscription', true );
+
+    if ( ! $sub_id ) {
+        // Try to find the most recent subscription for this customer
+        $customer_id = get_post_meta( $listing_id, 'listing_stripe_customer', true );
+        if ( $customer_id ) {
+            $subs = dealboard_stripe_api( 'GET', 'subscriptions?customer=' . rawurlencode( $customer_id ) . '&limit=5&status=all', [] );
+            if ( ! is_wp_error( $subs ) && ! empty( $subs['data'] ) ) {
+                foreach ( $subs['data'] as $s ) {
+                    $meta = $s['metadata'] ?? [];
+                    if ( isset( $meta['listing_id'] ) && (int) $meta['listing_id'] === $listing_id ) {
+                        $sub_id = $s['id'];
+                        update_post_meta( $listing_id, 'listing_stripe_subscription', $sub_id );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if ( $sub_id ) {
+        $sub        = dealboard_stripe_api( 'GET', 'subscriptions/' . rawurlencode( $sub_id ), [] );
+        $sub_status = ! is_wp_error( $sub ) ? ( $sub['status'] ?? '' ) : '';
+        $period_end = ( ! is_wp_error( $sub ) && ! empty( $sub['current_period_end'] ) )
+            ? (int) $sub['current_period_end'] : 0;
+        $autopay    = ( ! is_wp_error( $sub ) && empty( $sub['cancel_at_period_end'] ) ) ? '1' : '0';
+
+        if ( in_array( $sub_status, [ 'active', 'trialing' ], true ) ) {
+            update_post_meta( $listing_id, 'listing_autopay', $autopay );
+            dealboard_activate_business_listing( $listing_id, $period_end );
+            wp_safe_redirect( home_url( '/dashboard/?payment_success=1' ) );
+            exit;
+        }
+
+        if ( in_array( $sub_status, [ 'incomplete', 'past_due' ], true ) ) {
+            // Payment may still be processing — optimistically activate; webhook will finalize
+            update_post_meta( $listing_id, 'listing_autopay', '1' );
+            dealboard_activate_business_listing( $listing_id, $period_end );
+            wp_safe_redirect( home_url( '/dashboard/?payment_success=1' ) );
+            exit;
+        }
+    }
+
+    // If the webhook hasn't fired yet but the user is back, redirect with success —
+    // webhook will activate the listing when Stripe confirms.
+    wp_safe_redirect( home_url( '/dashboard/?payment_pending=1' ) );
     exit;
 }, 5 );
 
@@ -421,6 +476,17 @@ function dealboard_stripe_webhook( $request ) {
     $obj  = $event['data']['object'] ?? [];
 
     switch ( $type ) {
+
+        case 'checkout.session.completed':
+            // Stripe Checkout completed — link subscription to listing if not yet done
+            $sub_id     = $obj['subscription'] ?? '';
+            $meta       = $obj['metadata'] ?? [];
+            $listing_id = (int) ( $meta['listing_id'] ?? 0 );
+            if ( $listing_id && $sub_id ) {
+                update_post_meta( $listing_id, 'listing_stripe_subscription', $sub_id );
+                // Activation will happen via invoice.paid which fires right after
+            }
+            break;
 
         case 'invoice.paid':
         case 'invoice.payment_succeeded':
@@ -533,485 +599,6 @@ function dealboard_stripe_reconcile_subscriptions() {
 add_action( 'dealboard_daily_cron', 'dealboard_stripe_reconcile_subscriptions' );
 
 /* ===========================================================
-   ENQUEUE STRIPE.JS + LOCALIZE DATA
-=========================================================== */
-add_action( 'wp_enqueue_scripts', function() {
-    $o = dealboard_stripe_opts();
-    if ( ! $o['publishable_key'] ) return;
-
-    // Stripe.js — load globally so any page can open the payment modal
-    wp_enqueue_script( 'stripe-js', 'https://js.stripe.com/v3/', [], null, true );
-    wp_add_inline_script( 'stripe-js', dealboard_stripe_modal_js(), 'after' );
-    wp_add_inline_style_workaround();
-} );
-
-function wp_add_inline_style_workaround() {
-    // Inline style for the modal (piggyback on dealboard-style handle)
-    add_action( 'wp_head', function() {
-        echo '<style id="dealboard-stripe-modal-css">' . dealboard_stripe_modal_css() . '</style>';
-    }, 20 );
-}
-
-/* ===========================================================
-   INLINE CSS FOR THE PAYMENT MODAL
-=========================================================== */
-function dealboard_stripe_modal_css() {
-    return <<<'CSS'
-/* ── Stripe Payment Modal ───────────────────────────── */
-#db-payment-modal-backdrop {
-  display: none;
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,.55);
-  backdrop-filter: blur(4px);
-  z-index: 99990;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-}
-#db-payment-modal-backdrop.db-modal-open {
-  display: flex;
-  animation: dbFadeIn .2s ease;
-}
-@keyframes dbFadeIn { from{opacity:0} to{opacity:1} }
-
-#db-payment-modal {
-  background: #fff;
-  border-radius: 20px;
-  width: 100%;
-  max-width: 440px;
-  box-shadow: 0 24px 60px rgba(0,0,0,.25);
-  overflow: hidden;
-  animation: dbSlideUp .25s ease;
-}
-@keyframes dbSlideUp { from{transform:translateY(20px);opacity:0} to{transform:translateY(0);opacity:1} }
-
-#db-payment-modal .db-modal-header {
-  background: linear-gradient(135deg, #C8102E 0%, #9B000E 100%);
-  padding: 24px 28px 20px;
-  position: relative;
-}
-#db-payment-modal .db-modal-header h2 {
-  color: #fff;
-  font-size: 19px;
-  font-weight: 800;
-  margin: 0 0 4px;
-  line-height: 1.2;
-}
-#db-payment-modal .db-modal-header p {
-  color: rgba(255,255,255,.8);
-  font-size: 13px;
-  margin: 0;
-}
-#db-modal-close {
-  position: absolute;
-  top: 16px;
-  right: 16px;
-  background: rgba(255,255,255,.15);
-  border: none;
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  color: #fff;
-  font-size: 18px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background .15s;
-}
-#db-modal-close:hover { background: rgba(255,255,255,.3); }
-
-#db-payment-modal .db-modal-body {
-  padding: 28px;
-}
-
-.db-price-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: #FEF3C7;
-  border: 1px solid #FCD34D;
-  border-radius: 10px;
-  padding: 10px 16px;
-  margin-bottom: 22px;
-  width: 100%;
-  box-sizing: border-box;
-}
-.db-price-badge .db-price-amount {
-  font-size: 22px;
-  font-weight: 800;
-  color: #92400E;
-}
-.db-price-badge .db-price-label {
-  font-size: 12px;
-  color: #92400E;
-  line-height: 1.3;
-}
-
-#db-payment-element {
-  margin-bottom: 20px;
-  min-height: 80px;
-}
-
-.db-autopay-toggle {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: #F9FAFB;
-  border: 1px solid #E5E7EB;
-  border-radius: 10px;
-  padding: 12px 14px;
-  margin-bottom: 20px;
-  cursor: pointer;
-}
-.db-autopay-toggle input[type="checkbox"] {
-  width: 16px;
-  height: 16px;
-  accent-color: #C8102E;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.db-autopay-toggle label {
-  font-size: 13px;
-  color: #374151;
-  cursor: pointer;
-  line-height: 1.4;
-}
-.db-autopay-toggle label strong { color: #111827; }
-
-#db-pay-btn {
-  width: 100%;
-  padding: 14px;
-  background: #C8102E;
-  color: #fff;
-  font-size: 15px;
-  font-weight: 700;
-  border: none;
-  border-radius: 10px;
-  cursor: pointer;
-  font-family: inherit;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  transition: background .15s, opacity .15s;
-}
-#db-pay-btn:hover:not(:disabled) { background: #A50E26; }
-#db-pay-btn:disabled { opacity: .6; cursor: not-allowed; }
-
-#db-modal-error {
-  display: none;
-  background: #FEE2E2;
-  color: #DC2626;
-  border: 1px solid #FECACA;
-  border-radius: 8px;
-  padding: 12px 14px;
-  font-size: 13px;
-  margin-top: 14px;
-}
-
-#db-modal-success {
-  display: none;
-  text-align: center;
-  padding: 16px 0 4px;
-}
-#db-modal-success .db-success-icon { font-size: 52px; margin-bottom: 12px; }
-#db-modal-success h3 { font-size: 20px; font-weight: 800; color: #065F46; margin-bottom: 8px; }
-#db-modal-success p  { font-size: 14px; color: #6B7280; margin-bottom: 20px; }
-#db-modal-success a  {
-  display: inline-block;
-  padding: 12px 28px;
-  background: #059669;
-  color: #fff;
-  font-weight: 700;
-  border-radius: 10px;
-  text-decoration: none;
-  font-size: 15px;
-}
-
-.db-secure-note {
-  text-align: center;
-  font-size: 11px;
-  color: #9CA3AF;
-  margin-top: 14px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-}
-
-#db-modal-spinner {
-  display: none;
-  text-align: center;
-  padding: 32px 0;
-}
-#db-modal-spinner .db-spin {
-  width: 40px;
-  height: 40px;
-  border: 4px solid #E5E7EB;
-  border-top-color: #C8102E;
-  border-radius: 50%;
-  animation: dbSpin .8s linear infinite;
-  margin: 0 auto 12px;
-}
-@keyframes dbSpin { to { transform: rotate(360deg); } }
-CSS;
-}
-
-/* ===========================================================
-   INLINE JS FOR THE PAYMENT MODAL
-=========================================================== */
-function dealboard_stripe_modal_js() {
-    $ajax_url    = admin_url( 'admin-ajax.php' );
-    $nonce       = is_user_logged_in() ? wp_create_nonce( 'dealboard_stripe_nonce' ) : '';
-    $dashboard   = home_url( '/dashboard/' );
-
-    return <<<JS
-(function(){
-  /* ── Modal HTML ─────────────────────────────────────────── */
-  var html = `
-  <div id="db-payment-modal-backdrop">
-    <div id="db-payment-modal" role="dialog" aria-modal="true" aria-label="Complete Payment">
-      <div class="db-modal-header">
-        <button id="db-modal-close" aria-label="Close">&times;</button>
-        <h2>💳 Complete Payment</h2>
-        <p>Secure card payment powered by Stripe</p>
-      </div>
-      <div class="db-modal-body">
-        <div id="db-modal-spinner">
-          <div class="db-spin"></div>
-          <div style="font-size:14px;color:#6B7280">Setting up secure payment...</div>
-        </div>
-        <div id="db-modal-form" style="display:none">
-          <div class="db-price-badge">
-            <span style="font-size:24px">🏢</span>
-            <div>
-              <div class="db-price-amount">$2.00</div>
-              <div class="db-price-label">Business Listing · 30 days · auto-renews</div>
-            </div>
-          </div>
-          <div id="db-payment-element"></div>
-          <div class="db-autopay-toggle">
-            <input type="checkbox" id="db-autopay-check" checked>
-            <label for="db-autopay-check">
-              <strong>Enable auto-renewal</strong> — charge $2 every 30 days to keep ad live. You can turn this off anytime from your dashboard.
-            </label>
-          </div>
-          <button id="db-pay-btn">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>
-            Pay $2.00 &amp; Activate Listing
-          </button>
-          <div id="db-modal-error"></div>
-          <div class="db-secure-note">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-            256-bit SSL encryption · Powered by Stripe
-          </div>
-        </div>
-        <div id="db-modal-success">
-          <div class="db-success-icon">🎉</div>
-          <h3>Payment Successful!</h3>
-          <p>Your business listing is now live for 30 days.</p>
-          <a href="${dashboard}?payment_success=1">Go to Dashboard →</a>
-        </div>
-      </div>
-    </div>
-  </div>`;
-
-  document.body.insertAdjacentHTML('beforeend', html);
-
-  var backdrop  = document.getElementById('db-payment-modal-backdrop');
-  var closeBtn  = document.getElementById('db-modal-close');
-  var spinner   = document.getElementById('db-modal-spinner');
-  var form      = document.getElementById('db-modal-form');
-  var payBtn    = document.getElementById('db-pay-btn');
-  var errorBox  = document.getElementById('db-modal-error');
-  var successEl = document.getElementById('db-modal-success');
-
-  var stripeInstance = null;
-  var elements       = null;
-  var currentListing = 0;
-  var currentSubId   = '';
-
-  /* ── Open modal ─────────────────────────────────────────── */
-  window.dbOpenPaymentModal = function(listingId) {
-    currentListing = listingId;
-    currentSubId   = '';
-    backdrop.classList.add('db-modal-open');
-    document.body.style.overflow = 'hidden';
-    spinner.style.display  = 'block';
-    form.style.display     = 'none';
-    successEl.style.display= 'none';
-    errorBox.style.display = 'none';
-    payBtn.disabled = false;
-
-    // Clear previous Payment Element
-    var pe = document.getElementById('db-payment-element');
-    pe.innerHTML = '';
-
-    var fd = new FormData();
-    fd.append('action',     'dealboard_create_payment_intent');
-    fd.append('nonce',      '${nonce}');
-    fd.append('listing_id', listingId);
-
-    fetch('${ajax_url}', { method:'POST', body:fd, credentials:'same-origin' })
-      .then(function(r){ return r.json(); })
-      .then(function(res){
-        if(!res.success){
-          dbShowError(res.data && res.data.message ? res.data.message : 'Payment setup failed.');
-          return;
-        }
-        var d = res.data;
-        currentSubId = d.sub_id || '';
-
-        if(!window.Stripe){
-          dbShowError('Stripe.js failed to load. Please refresh and try again.');
-          return;
-        }
-        stripeInstance = Stripe(d.publishable_key);
-        elements = stripeInstance.elements({
-          clientSecret: d.client_secret,
-          appearance: {
-            theme: 'stripe',
-            variables: {
-              colorPrimary:       '#C8102E',
-              colorBackground:    '#ffffff',
-              colorText:          '#111827',
-              colorDanger:        '#DC2626',
-              fontFamily:         'Inter, system-ui, sans-serif',
-              spacingUnit:        '4px',
-              borderRadius:       '8px',
-              fontSizeBase:       '14px',
-            }
-          }
-        });
-
-        var paymentEl = elements.create('payment', {
-          layout: { type:'tabs', defaultCollapsed:false },
-        });
-        paymentEl.mount('#db-payment-element');
-        paymentEl.on('ready', function(){
-          spinner.style.display = 'none';
-          form.style.display    = 'block';
-        });
-      })
-      .catch(function(err){
-        dbShowError('Network error. Please check your connection and try again.');
-        console.error(err);
-      });
-  };
-
-  /* ── Pay button ─────────────────────────────────────────── */
-  payBtn.addEventListener('click', function(){
-    if(!stripeInstance || !elements) return;
-    payBtn.disabled = true;
-    payBtn.innerHTML = '<span style="border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;width:16px;height:16px;display:inline-block;animation:dbSpin .7s linear infinite"></span> Processing...';
-    errorBox.style.display = 'none';
-
-    stripeInstance.confirmPayment({
-      elements: elements,
-      confirmParams: {
-        // Return URL required by Stripe but we handle result inline
-        return_url: '${dashboard}?payment_success=1',
-      },
-      redirect: 'if_required'  // stay on page if no 3D Secure needed
-    })
-    .then(function(result){
-      if(result.error){
-        dbShowError(result.error.message || 'Payment failed. Please try again.');
-        payBtn.disabled = false;
-        payBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg> Pay $2.00 &amp; Activate Listing';
-        return;
-      }
-      var pi = result.paymentIntent;
-      if(pi && (pi.status === 'succeeded' || pi.status === 'processing')){
-        dbConfirmServer(pi.id);
-      } else {
-        dbShowError('Unexpected payment status: ' + (pi ? pi.status : 'unknown'));
-        payBtn.disabled = false;
-        payBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg> Pay $2.00 &amp; Activate Listing';
-      }
-    });
-  });
-
-  /* ── Confirm with server ────────────────────────────────── */
-  function dbConfirmServer(piId) {
-    var fd = new FormData();
-    fd.append('action',         'dealboard_confirm_payment');
-    fd.append('nonce',          '${nonce}');
-    fd.append('listing_id',     currentListing);
-    fd.append('payment_intent', piId);
-    fd.append('sub_id',         currentSubId);
-
-    fetch('${ajax_url}', { method:'POST', body:fd, credentials:'same-origin' })
-      .then(function(r){ return r.json(); })
-      .then(function(res){
-        form.style.display = 'none';
-        if(res.success){
-          successEl.style.display = 'block';
-          // Auto-redirect after 3 seconds
-          setTimeout(function(){
-            window.location.href = '${dashboard}?payment_success=1';
-          }, 3000);
-        } else {
-          dbShowError((res.data && res.data.message) || 'Confirmation failed.');
-          payBtn.disabled = false;
-          payBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg> Pay $2.00 &amp; Activate Listing';
-          form.style.display = 'block';
-        }
-      })
-      .catch(function(){
-        dbShowError('Server confirmation failed. Check your dashboard — if payment went through, your listing will activate shortly.');
-        form.style.display = 'block';
-        payBtn.disabled = false;
-        payBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg> Pay $2.00 &amp; Activate Listing';
-      });
-  }
-
-  /* ── Close modal ─────────────────────────────────────────── */
-  function dbCloseModal() {
-    backdrop.classList.remove('db-modal-open');
-    document.body.style.overflow = '';
-    if (document.getElementById('post-ad-form')) {
-      window.location.href = '${dashboard}?dealboard_payment=cancel&listing=' + currentListing;
-    }
-  }
-  closeBtn.addEventListener('click', dbCloseModal);
-  backdrop.addEventListener('click', function(e){
-    if(e.target === backdrop) dbCloseModal();
-  });
-  document.addEventListener('keydown', function(e){
-    if(e.key === 'Escape') dbCloseModal();
-  });
-
-  /* ── Error helper ────────────────────────────────────────── */
-  function dbShowError(msg){
-    spinner.style.display = 'none';
-    if(form.style.display === 'none' && successEl.style.display === 'none'){
-      form.style.display = 'block';
-    }
-    errorBox.textContent = '❌ ' + msg;
-    errorBox.style.display = 'block';
-    errorBox.scrollIntoView({ behavior:'smooth', block:'nearest' });
-  }
-
-  /* ── Auto-open if URL has open_payment_modal param ─────── */
-  document.addEventListener('DOMContentLoaded', function(){
-    var params = new URLSearchParams(window.location.search);
-    var lid = params.get('open_payment_modal');
-    if(lid) {
-      window.dbOpenPaymentModal(parseInt(lid, 10));
-      // Clean URL
-      var url = new URL(window.location.href);
-      url.searchParams.delete('open_payment_modal');
-      window.history.replaceState({}, '', url);
-    }
-  });
-})();
-JS;
-}
-
-/* ===========================================================
    ADMIN SETTINGS PAGE  (Settings → Payments & Mail)
 =========================================================== */
 add_action( 'admin_menu', function() {
@@ -1067,7 +654,7 @@ function dealboard_payments_settings_page() {
 
             <h2>Stripe (Business Ad Subscriptions — $2 / 30 days)</h2>
             <p class="description" style="margin-bottom:16px">
-                Payments are collected <strong>on-page</strong> via a card popup modal (no redirect to Stripe).<br>
+                Payments are collected via <strong>Stripe-hosted Checkout</strong> (user is redirected to Stripe's secure payment page).<br>
                 Auto-renewal charges $2 every 30 days. Users can turn it off from their dashboard.
             </p>
             <table class="form-table">
@@ -1084,7 +671,7 @@ function dealboard_payments_settings_page() {
                     <td>
                         <input type="text" name="dealboard_stripe[webhook_secret]" value="<?php echo esc_attr( $o['webhook_secret'] ); ?>" class="regular-text" placeholder="whsec_…">
                         <p class="description">Add a webhook in Stripe pointing to:<br><code><?php echo esc_html( $hook ); ?></code><br>
-                        Events: <code>invoice.paid</code>, <code>invoice.payment_failed</code>, <code>customer.subscription.updated</code>, <code>customer.subscription.deleted</code>.</p>
+                        Events: <code>checkout.session.completed</code>, <code>invoice.paid</code>, <code>invoice.payment_failed</code>, <code>customer.subscription.updated</code>, <code>customer.subscription.deleted</code>.</p>
                     </td>
                 </tr>
                 <tr>
