@@ -456,6 +456,53 @@ table.db-table tbody tr:hover td { background: #FAFAFA; }
   .db-pagination { flex-direction: column; align-items: flex-start; padding: 14px 16px; }
   .db-pag-btn { min-width: 32px; height: 32px; font-size: 12px; }
 }
+
+/* ── Toast Notification (Top-Left) ────────────────────────── */
+.db-toast-container {
+  position: fixed;
+  top: 24px;
+  left: 24px;
+  z-index: 99999;
+  max-width: 380px;
+  width: calc(100% - 48px);
+  pointer-events: none;
+}
+.db-toast {
+  background: #ffffff;
+  border-left: 4px solid #059669;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.16);
+  border-radius: 10px;
+  padding: 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  pointer-events: auto;
+  animation: dbToastSlideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+@keyframes dbToastSlideIn {
+  from { opacity: 0; transform: translateX(-40px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.db-toast.fade-out {
+  opacity: 0;
+  transform: translateX(-40px);
+}
+.db-toast-icon {
+  font-size: 20px;
+  flex-shrink: 0;
+  line-height: 1;
+}
+.db-toast-content {
+  font-size: 13.5px;
+  color: #374151;
+  line-height: 1.5;
+}
+.db-toast-title {
+  font-weight: 700;
+  color: #065F46;
+  margin-bottom: 3px;
+}
 </style>
 
 <div class="db-page">
@@ -486,10 +533,29 @@ table.db-table tbody tr:hover td { background: #FAFAFA; }
 
     <!-- Alerts -->
     <?php if(isset($_GET['payment_success'])): ?>
-    <div class="db-alert db-alert-success">
-      <span style="font-size:18px">✅</span>
-      <div><strong>Payment successful!</strong> Your business listing is now live for 30 days. It will renew automatically for $2 unless you turn off auto-payment below.</div>
+    <div class="db-toast-container">
+      <div class="db-toast" id="db-success-toast">
+        <span class="db-toast-icon">✅</span>
+        <div class="db-toast-content">
+          <div class="db-toast-title">Payment successful!</div>
+          <div>Your business listing is now live for 30 days. It will renew automatically for $2 unless you turn off auto-payment below.</div>
+        </div>
+      </div>
     </div>
+    <script>
+    document.addEventListener("DOMContentLoaded", function() {
+      var toast = document.getElementById("db-success-toast");
+      if (toast) {
+        setTimeout(function() {
+          toast.classList.add("fade-out");
+          setTimeout(function() {
+            var container = toast.closest(".db-toast-container");
+            if (container) container.remove();
+          }, 300);
+        }, 4700);
+      }
+    });
+    </script>
     <?php endif; ?>
     <?php if(isset($_GET['payment_pending'])): ?>
     <div class="db-alert db-alert-warn">
