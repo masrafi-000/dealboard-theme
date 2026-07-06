@@ -689,6 +689,28 @@ add_action('login_init', function() {
     }
 }, 1);
 
+/* Intercept /reset-password requests dynamically so it doesn't require a page in the database */
+add_action('parse_request', function($wp) {
+    $is_reset = false;
+    if (isset($wp->request) && preg_match('#^reset-password/?$#i', $wp->request)) {
+        $is_reset = true;
+    }
+    if (!$is_reset && isset($_SERVER['REQUEST_URI'])) {
+        $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+        // Handle subdirectory installs as well
+        if (preg_match('#/reset-password/?$#i', $path)) {
+            $is_reset = true;
+        }
+    }
+    if ($is_reset) {
+        $template = DEALBOARD_DIR . '/page-reset-password.php';
+        if (file_exists($template)) {
+            include $template;
+            exit;
+        }
+    }
+});
+
 add_filter('lostpassword_redirect', function($redirect) {
     return home_url('/forgot-password/?sent=1');
 });
