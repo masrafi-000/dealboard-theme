@@ -11,6 +11,30 @@ $token = '';
 $pending_email = '';
 
 /* ---------------------------------------------------------
+   Helper: check if an SMTP plugin / mailer is configured.
+   wp_mail() on a vanilla XAMPP install uses PHP mail() which
+   usually silently fails. We detect this and warn the user.
+--------------------------------------------------------- */
+function dealboard_smtp_likely_configured() {
+    // Popular SMTP plugins that hook into phpmailer_init
+    $smtp_plugins = [
+        'wp-mail-smtp/wp_mail_smtp.php',
+        'post-smtp/postman-smtp.php',
+        'easy-wp-smtp/easy-wp-smtp.php',
+        'smtp-mailer/smtp-mailer.php',
+        'fluent-smtp/fluent-smtp.php',
+        'sendgrid-email-delivery-simplified/wpsendgrid.php',
+    ];
+    foreach ( $smtp_plugins as $plugin ) {
+        if ( is_plugin_active( $plugin ) ) return true;
+    }
+    // Custom from address is set (admin took some mail action)
+    $opt = get_option( 'dealboard_mail_from' );
+    if ( $opt && is_email( $opt ) ) return true;
+    return false;
+}
+
+/* ---------------------------------------------------------
    STEP 1 — registration details → send OTP (no account yet)
 --------------------------------------------------------- */
 if(isset($_POST['signup_submit']) && wp_verify_nonce($_POST['_wpnonce'] ?? '','dealboard_signup')){
@@ -33,10 +57,35 @@ if(isset($_POST['signup_submit']) && wp_verify_nonce($_POST['_wpnonce'] ?? '','d
       'password' => $pass,
       'otp'      => $otp,
     ]);
-    dealboard_send_otp_email($email, $username, $otp);
-    $pending_email = $email;
-    $step   = 'verify';
-    $notice = 'We emailed a 6-digit verification code to ' . $email . '.';
+
+    // ── Try to send the OTP email ──────────────────────────
+    $sent = dealboard_send_otp_email($email, $username, $otp);
+
+    if ( $sent ) {
+      // Mail delivered (or queued by SMTP plugin)
+      $pending_email = $email;
+      $step   = 'verify';
+      $notice = 'We emailed a 6-digit verification code to ' . $email . '.';
+    } else {
+      // wp_mail() returned false → mail not sent
+      dealboard_delete_pending_signup($token); // clean up the transient
+      $token = '';
+      if ( is_admin() || ( defined('WP_DEBUG') && WP_DEBUG ) ) {
+        // Dev environment: show OTP on screen so testing is possible
+        $pending_email = $email;
+        $token = dealboard_store_pending_signup([
+          'username' => $username,
+          'email'    => $email,
+          'password' => $pass,
+          'otp'      => $otp,
+        ]);
+        $step   = 'verify';
+        $notice = '[DEV MODE] Email not sent. Your OTP is: ' . $otp;
+      } else {
+        $error = 'We could not send a verification email to ' . esc_html($email)
+               . '. Please check the address and try again, or contact support if the problem persists.';
+      }
+    }
   }
 }
 
@@ -51,10 +100,23 @@ if(isset($_POST['otp_resend']) && wp_verify_nonce($_POST['_wpnonce'] ?? '','deal
     $pending['otp']   = $otp;
     $pending['tries'] = 0;
     dealboard_update_pending_signup($token, $pending);
-    dealboard_send_otp_email($pending['email'], $pending['username'], $otp);
-    $pending_email = $pending['email'];
-    $step   = 'verify';
-    $notice = 'A new verification code has been sent to ' . $pending['email'] . '.';
+
+    // ── Try to send the OTP email ────────────────────────
+    $sent = dealboard_send_otp_email($pending['email'], $pending['username'], $otp);
+
+    if ( $sent ) {
+      $pending_email = $pending['email'];
+      $step   = 'verify';
+      $notice = 'A new verification code has been sent to ' . $pending['email'] . '.';
+    } else {
+      $pending_email = $pending['email'];
+      $step = 'verify';
+      if ( defined('WP_DEBUG') && WP_DEBUG ) {
+        $notice = '[DEV MODE] Email not sent. Your new OTP is: ' . $otp;
+      } else {
+        $error = 'Could not resend the verification email. Please check your email address or contact support.';
+      }
+    }
   } else {
     $error = 'Your session expired. Please sign up again.';
     $step  = 'register';

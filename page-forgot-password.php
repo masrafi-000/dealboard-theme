@@ -12,10 +12,10 @@ if (isset($_POST['forgot_nonce']) && wp_verify_nonce($_POST['forgot_nonce'], 'fo
     if ($user) {
       $key = get_password_reset_key($user);
       if (!is_wp_error($key)) {
-        $reset_url = network_site_url(
-          "wp-login.php?action=rp&key={$key}&login=" . rawurlencode($user->user_login),
-          'login'
-        );
+        $reset_url = add_query_arg([
+          'key'   => $key,
+          'login' => rawurlencode($user->user_login),
+        ], home_url('/reset-password/'));
         $subject = 'Reset Your Password — ' . get_bloginfo('name');
         $message = "Hi {$user->display_name},\n\n";
         $message .= "You requested a password reset for your account.\n\n";
